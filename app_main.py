@@ -130,6 +130,7 @@ def request_buzzer_stop():
     last_mild_beep_time = now
 
 
+FACTORY_BTN = Pin(16, Pin.IN, Pin.PULL_UP)   # GP16, active-low
 
 
 # --- Logo Config ---
@@ -565,13 +566,13 @@ def mgdl_to_units(val_mgdl: float) -> float:
 
 def direction_to_arrow(direction: str) -> str:
     return {
-        "Flat": "B",
-        "SingleUp": "G",
-        "DoubleUp": "GG",
-        "SingleDown": "H",
-        "DoubleDown": "HH",
-        "FortyFiveUp": "D",
-        "FortyFiveDown": "F",
+        "Flat": "J",
+        "SingleUp": "O",
+        "DoubleUp": "OO",
+        "SingleDown": "P",
+        "DoubleDown": "PP",
+        "FortyFiveUp": "L",
+        "FortyFiveDown": "N",
         "NOT COMPUTABLE": "--",
         "NONE": "--",
     }.get(direction or "NONE", "")
@@ -674,6 +675,7 @@ def fmt_delta(delta_val) -> str:
 
 class ScreenState:
     def __init__(self):
+        self.factory_mode = False
         self.age_text = None
         self.age_color = None
 
@@ -826,7 +828,12 @@ def _draw_bg_if_changed(lcd, new_text, new_color, st, y_bg):
 
 
 
-def _draw_arrow_if_changed(lcd, w_arrow, new_text, new_color, st, x_arrow, y_arrow):
+def _draw_arrow_if_changed(lcd, w_arrow, new_text, new_color, st, x_arrow, y_arrow, x_offset=0, y_offset=0):
+    #new_text = "O"
+    
+    x_arrow = x_arrow + x_offset
+    y_arrow = y_arrow + y_offset
+    
     if st.arrow_text == new_text and st.arrow_color == new_color:
         return
 
@@ -854,8 +861,11 @@ def _draw_delta_if_changed(lcd, w_small, w_delta_icon, new_delta_text, st, y_del
         return
 
     W = lcd.width
-    gap = 5
-    v_offset = -7
+    gap = 12
+    v_offset = -8
+    NUM_Y_OFFSET = -5   # negative = up, positive = down
+    NUM_X_OFFSET = -5    # negative = left, positive = right
+
 
     # Compute old box
     old_bbox = None
@@ -911,7 +921,7 @@ def _draw_delta_if_changed(lcd, w_small, w_delta_icon, new_delta_text, st, y_del
     w_delta_icon.set_textpos(lcd, y_delta_centered, x_sign)
     w_delta_icon.printstring(sign)
 
-    w_small.set_textpos(lcd, y_delta, x_num)
+    w_small.set_textpos(lcd, y_delta + NUM_Y_OFFSET, x_num + NUM_X_OFFSET)
     w_small.printstring(val_num)
 
     _show_rect(lcd, dirty[0], dirty[1], dirty[2], dirty[3])
@@ -941,6 +951,11 @@ def draw_all_fields_if_needed(
     last, hb_state,
     st
 ):
+    
+    if st.factory_mode:
+        return
+
+
     W, H = lcd.width, lcd.height
     
     y_age = 6
@@ -1022,7 +1037,7 @@ def draw_all_fields_if_needed(
     _draw_age_if_changed(lcd, w_age_small, age_text, age_color, st, y_age)
     _draw_heart_if_changed(lcd, w_heart, hb_state, st, x_heart, y_heart, pad=2)
     _draw_bg_if_changed(lcd, bg_text, bg_color, st, y_bg)
-    _draw_arrow_if_changed(lcd, w_arrow, arrow_text, arrow_color, st, x_arrow, y_arrow)
+    _draw_arrow_if_changed(lcd, w_arrow, arrow_text, arrow_color, st, x_arrow, y_arrow, x_offset=10, y_offset=-10)
     _draw_delta_if_changed(lcd, w_small, w_delta_icon, delta_text, st, y_delta, right_margin=4)
     _draw_batt_x_if_changed(lcd, w_batt, st, x=10, y=8)
     _end_batch(lcd)
@@ -1154,6 +1169,66 @@ async def task_buzzer_driver():
 
 
 
+async def task_factory_reset(lcd, w_small, st):
+    HOLD_MS = 3000
+    POLL_MS = 25
+
+    pressed_start = None
+    last_shown = None
+
+    while True:
+        if FACTORY_BTN.value() == 0:  # pressed (active-low)
+            now = utime.ticks_ms()
+
+            if pressed_start is None:
+                pressed_start = now
+                last_shown = None
+                st.factory_mode = True  # TAKE OVER IMMEDIATELY
+
+            elapsed = utime.ticks_diff(now, pressed_start)
+            remaining = max(0, (HOLD_MS - elapsed + 999) // 1000)  # 3..0
+
+            # Always show a full-screen reset warning (no other UI)
+            if remaining != last_shown and remaining in (3, 2, 1):
+                lcd.fill(BLACK)
+                w_small.setcolor(WHITE, BLACK)
+
+                w_small.set_textpos(lcd, 110, 40)
+                w_small.printstring("Factory resetting in")
+
+                w_small.set_textpos(lcd, 170, 230)
+                w_small.printstring(str(remaining))
+
+                lcd.show()
+                last_shown = remaining
+
+            if elapsed >= HOLD_MS:
+                lcd.fill(BLACK)
+                w_small.setcolor(WHITE, BLACK)
+                w_small.set_textpos(lcd, 150, 120)
+                w_small.printstring("Resetting...")
+                lcd.show()
+
+                try:
+                    import os
+                    os.remove("config.py")
+                except:
+                    pass
+
+                try:
+                    import machine
+                    machine.reset()
+                except:
+                    pass
+
+        else:
+            # released early: exit reset mode immediately
+            pressed_start = None
+            last_shown = None
+            st.factory_mode = False
+
+        await asyncio.sleep_ms(POLL_MS)
+
 
 async def async_main(lcd, w_small, w_age_small, w_arrow, w_heart, w_delta_icon, w_batt, st):
     asyncio.create_task(task_power_monitor())
@@ -1269,6 +1344,8 @@ def main(framebuffer=None):
 
     # 1. INIT DISPLAY (uses existing framebuffer passed from bootloader)
     lcd = LCD_Driver(fb=framebuffer)
+    globals()["LCD"] = lcd
+
 
     # 2. INIT WRITERS
     w_small = CWriter(lcd, font_small, fgcolor=WHITE, bgcolor=BLACK, verbose=False)
